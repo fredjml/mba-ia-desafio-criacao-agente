@@ -1,0 +1,65 @@
+# protected-paths.yml — CONTROLE MECANICO no servidor: as pastas protegidas e os arquivos de CONTROLE nao mudaram (Constitution §6, §19, §21; docs2/THREAT-MODEL.md R1, R8).
+# TEMPLATE (GitHub Actions). NAO foi executado em um repositorio real: so a sintaxe (parser YAML) e a logica dos comandos (simulacao local) foram testadas.
+# Como usar: copie para <projeto-alvo>/.github/workflows/protected-paths.yml. Assume o docs2 em <raiz>/docs2/ e o manifesto em <raiz>/PROTECTED-MANIFEST.json
+#   (gere com: node docs2/plan/templates/controls/protected-manifest.mjs --init --dirs <pastas>; versione o arquivo). Ajuste os caminhos se sua instancia for outra.
+# O que faz, num pull request (PR):
+#   (1) confere o hash de todos os arquivos das pastas protegidas contra o manifesto, usando o VERIFICADOR DO RAMO DE DESTINO (segundo checkout em .base/), nao o da arvore do PR:
+#       um PR que troque protected-manifest.mjs por `process.exit(0)` NAO neutraliza a conferencia;
+#   (2) FALHA se o proprio manifesto mudou em relacao ao ramo de destino (evita "mudar o dado e o manifesto juntos" sem revisao) — aprovacao consciente = rotulo `baseline-aprovado`;
+#   (3) FALHA se algum ARQUIVO DE CONTROLE mudou em relacao ao ramo de destino (controls/, ci/, hooks/ do docs2, .github/workflows, .claude/settings.json, CODEOWNERS,
+#       HOOK-TRUST.json) — aprovacao consciente = rotulo `controle-aprovado`. Sem isto, quem edita o proprio controle o desliga no mesmo PR.
+#       HOOK-TRUST.json entrou nesta lista na r11 (achado N2 da 6a validacao independente, 2026-09-22): antes, so `.claude/settings.json` (a fonte real do
+#       hook) estava listado, o que ja cobria a mudanca de hook em si, mas deixava passar sem revisao um PR que reescrevesse SO o registro de confianca
+#       (um "re-baseline" silencioso antes de uma mudanca futura de settings.json). Se a instancia gravar o registro em outro caminho (flag `--trust` de
+#       hook-trust.mjs), acrescente esse caminho tambem a este `git diff`.
+#   Num push para main o verificador e o da propria arvore (ja passou pelo PR).
+# O QUE ISTO NAO FAZ SOZINHO (depende de configuracao do dono do repositorio, nao do workflow): proteger o ramo (checks obrigatorios), CODEOWNERS nos arquivos de controle
+#   e restringir quem pode aplicar os rotulos `baseline-aprovado`/`controle-aprovado` (quem escreve no ramo ou tem triagem pode desliga-los). Sem isso os rotulos sao politica, nao barreira.
+# Acoes fixadas por SHA de commit (comentario = versao). Verifique/atualize os SHAs periodicamente (Dependabot para "github-actions").
+name: protected-paths
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o repositorio (com o ramo de destino, para comparar o manifesto e os arquivos de controle)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 'Baixar o RAMO DE DESTINO em .base/ (o verificador confiavel; so PR)'
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.base_ref }}
+          path: .base
+          persist-credentials: false
+      - name: Node LTS
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 'lts/*'
+      - name: Conferir o manifesto das pastas protegidas (PR - verificador do ramo de destino)
+        if: ${{ github.event_name == 'pull_request' }}
+        run: node .base/.github/scripts/protected-manifest.mjs --check --manifest PROTECTED-MANIFEST.json --root .
+      - name: Conferir o manifesto das pastas protegidas (push - verificador da propria arvore)
+        if: ${{ github.event_name != 'pull_request' }}
+        run: node .github/scripts/protected-manifest.mjs --check --manifest PROTECTED-MANIFEST.json
+      - name: O manifesto nao mudou em relacao ao ramo de destino (so PR sem rotulo baseline-aprovado)
+        if: ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'baseline-aprovado') }}
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git diff --exit-code origin/$BASE_REF -- PROTECTED-MANIFEST.json
+      - name: Os arquivos de controle nao mudaram em relacao ao ramo de destino (so PR sem rotulo controle-aprovado)
+        if: ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'controle-aprovado') }}
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git diff --exit-code origin/$BASE_REF -- .github/scripts .github/workflows .claude/settings.json CODEOWNERS .github/CODEOWNERS HOOK-TRUST.json
