@@ -1,0 +1,21 @@
+[project]
+name = "aurora"
+version = "0.1.0"
+description = "Assistente Virtual Residencial Aurora"
+requires-python = ">=3.12"
+dependencies = [
+    "google-adk[db]==2.9.2",
+    "fastapi",
+    "uvicorn",
+    # 2.1.0 (2026-09-24) tira greenlet do núcleo; ADK 2.9.2 [db] quebra.
+    "sqlalchemy[asyncio]>=2.0.54,<2.1",
+    "aiosqlite",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Layout src/: hatchling descobre src/aurora e o uv instala o pacote
+# de modo que `import aurora` funcione após `python -m uv sync`.
+# Sem dependências de desenvolvimento.
