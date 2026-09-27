@@ -4,16 +4,16 @@ Política D6 (texto novo com pendência): cancela na tabela e segue o
 texto. Evidência em api/smoke_conversa.py B4 (Gemini real). Aprovação do
 id cancelado → ConfirmacaoInexistente; 0 execuções.
 
-Política de falha (retomada ADK após transição): transiciona primeiro
-(impede 2ª aprovação). Se o ADK levantar ValueError/StaleSessionError,
-reverte para pendente e devolve o contrato vazio. Motivo: tools são
-idempotentes; sem revert a pendência ficaria aprovada sem efeito
-(estado preso); com revert o morador reenvia. A exceção do ADK não vaza.
+Política de falha: pendente → processando antes da retomada (impede 2ª
+aprovação) e só então → aprovada/negada. Qualquer falha ou cancelamento
+reverte para pendente; ValueError/StaleSessionError preservam o contrato
+vazio. Quedas são recuperadas na partida e, após o limite, durante o uso.
 """
 
 from __future__ import annotations
 
 from typing import Any
+from weakref import WeakValueDictionary
 
 import asyncio
 
@@ -27,16 +27,19 @@ from aurora.dados.pendencias import (
     STATUS_APROVADA,
     STATUS_NEGADA,
     cancelar_pendentes,
+    finalizar_processamento,
     garantir_tabela,
+    iniciar_processamento,
     listar_pendentes,
+    recuperar_processando,
     registrar,
     reverter_para_pendente,
-    transicionar,
 )
 from aurora.runtime.fabrica import RuntimeMontado, montar_runtime
 
 APPROVAL_NAME = "adk_request_confirmation"
 USER_ID = "morador"
+LIMITE_PROCESSANDO_S = 300.0
 
 
 class SessaoInexistente(Exception):
@@ -139,11 +142,12 @@ def criar_servico(
 class ServicoConversa:
     def __init__(self, runtime: RuntimeMontado) -> None:
         self._runtime = runtime
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._user_id = USER_ID
         self.ultimo_uso = {"prompt": 0, "candidates": 0, "total": 0, "chamadas": 0}
         self.ultimo_turno: dict[str, Any] = {}
         garantir_tabela()
+        recuperar_processando()
 
     def _lock(self, session_id: str) -> asyncio.Lock:
         lock = self._locks.get(session_id)
@@ -243,6 +247,9 @@ class ServicoConversa:
 
     async def enviar_mensagem(self, session_id: str, texto: str) -> dict[str, Any]:
         async with self._lock(session_id):
+            recuperar_processando(
+                session_id, mais_velho_que_s=LIMITE_PROCESSANDO_S
+            )
             await self._obter_sessao(session_id)
             # D6: cancela na tabela e segue (sem negação sintética).
             # Evidência B4 (Gemini real, 2026-09-25): pendência aberta +
@@ -261,17 +268,28 @@ class ServicoConversa:
         self, session_id: str, id: str, confirmado: bool
     ) -> dict[str, Any]:
         async with self._lock(session_id):
+            recuperar_processando(
+                session_id, mais_velho_que_s=LIMITE_PROCESSANDO_S
+            )
             await self._obter_sessao(session_id)
             destino = STATUS_APROVADA if confirmado else STATUS_NEGADA
-            if not transicionar(session_id, id, destino):
+            if not iniciar_processamento(session_id, id, destino):
                 raise ConfirmacaoInexistente(id)
+            concluido = False
             try:
-                events = await self._rodar(
-                    session_id, _mensagem_confirmacao(id, confirmado)
-                )
-            except (ValueError, StaleSessionError):
-                reverter_para_pendente(session_id, id)
-                return self._resposta_segura(session_id)
-            self._anotar_turno(events)
-            self._registrar_novas(session_id, events)
+                try:
+                    events = await self._rodar(
+                        session_id, _mensagem_confirmacao(id, confirmado)
+                    )
+                except (ValueError, StaleSessionError):
+                    return self._resposta_segura(session_id)
+                self._anotar_turno(events)
+                self._registrar_novas(session_id, events)
+                if not finalizar_processamento(session_id, id):
+                    raise RuntimeError("pendência deixou de estar processando")
+                concluido = True
+            finally:
+                # Síncrono de propósito: CancelledError não interrompe a reversão.
+                if not concluido:
+                    reverter_para_pendente(session_id, id)
             return self._contrato(session_id, self.ultimo_turno.get("text") or "")

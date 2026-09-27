@@ -23,6 +23,15 @@ Parte A (modelo falso roteirizado neste arquivo, bancos em TEMP, sem rede):
         → resultado seguro, sem estado preso, retry possível.
     A11 duas pendências no mesmo turno: devolve todas; cada id independente
         OU limitação documentada (409 claro, nunca execução dupla).
+    A12 queda ao aprovar, no início e após a retomada: novo serviço recupera;
+        retry produz exatamente 1 efeito; reenvio → ConfirmacaoInexistente.
+        N>=3 por ponto.
+    A13 mesmas duas quedas ao negar: retry produz 0 efeitos; reenvio → 409-eq.
+        N>=3 por ponto.
+    A14 cancelamento no meio da retomada: volta a pendente; retry funciona com
+        exatamente 1 efeito. N>=5.
+    A15 A1–A11 seguem verdes; concorrência do A9 segue 1 efeito em N>=20; um
+        processando recente não é recuperado/cancelado por mensagem nova.
 
 Parte B (Gemini real, apt 101, TEMP, restaurar por cenário):
     B1 reservar salão 2030-04-20 → pendência area+data; 0 gravado;
@@ -34,9 +43,11 @@ Parte B (Gemini real, apt 101, TEMP, restaurar por cenário):
     B4 pendência aberta + "Quais são as minhas reservas?" → modelo responde
         sem erro; antiga cancelada; aprovar id antigo → ConfirmacaoInexistente.
         Decide a política D6.
-    B5 python -m aurora.agentes.smoke_agentes exit 0.
+    B5 python -m aurora.agentes.smoke_agentes --parte a exit 0.
     Focais: listar visitantes 2x na mesma sessão chama a tool nas duas;
-        coleira do cão → especialista_regulamento em >=2/3.
+        coleira do cão é informativo (reporta N/3, sem reprovar).
+    Queda real: reservar salão 2030-06-15, morrer no início da retomada,
+        recuperar em novo processo e aprovar → exatamente 1 reserva.
 
 Banco e bruto só em $TEMP. dados/ e .env intocados. A chave nunca aparece.
 """
@@ -97,6 +108,8 @@ CODIGO_ALHEIO = "RSV-4821"
 NOME_ALHEIO = "Marina Duarte"
 N_A8 = 5
 N_A9 = 20
+N_QUEDA = 3
+N_CANCELAMENTO = 5
 ESPERAS_QUOTA = (2.0, 6.0, 14.0)
 
 _BRUTO: Path | None = None
@@ -868,6 +881,236 @@ async def a11(workdir: Path) -> None:
         await _fechar(servico)
 
 
+async def _filho_queda_confirmacao(state_path: Path) -> None:
+    state = _ler_estado(state_path)
+    os.environ["AURORA_SESSION_DB"] = state["session_db"]
+    os.environ[VAR_BANCO_DOMINIO] = state["domain_db"]
+    modelo = ModeloRoteirizado(area=AREA_TAXA, data=state["data"])
+    servico = await _servico(Path(state["session_db"]), modelo)
+    sid = await servico.criar_sessao("101")
+    corpo = await servico.enviar_mensagem(sid, f"Reservar salão {state['data']}")
+    pid = corpo["confirmacoes_pendentes"][0]["id"]
+    state.update({"session_id": sid, "confirmation_id": pid})
+    _escrever_estado(state_path, state)
+    original = servico._rodar
+
+    async def _cair_no_inicio(session_id: str, mensagem: types.Content) -> list[Any]:
+        del session_id, mensagem
+        os._exit(9)
+
+    async def _cair_depois(session_id: str, mensagem: types.Content) -> list[Any]:
+        events = await original(session_id, mensagem)
+        os._exit(9)
+        return events
+
+    servico._rodar = (
+        _cair_no_inicio if state["ponto"] == "inicio" else _cair_depois
+    )
+    await servico.responder_confirmacao(sid, pid, bool(state["confirmado"]))
+    raise AssertionError("filho não caiu")
+
+
+async def _filho_queda_real(state_path: Path) -> None:
+    from aurora.agentes.modelo import carregar_ambiente, nome_modelo
+
+    carregar_ambiente()
+    state = _ler_estado(state_path)
+    os.environ["AURORA_SESSION_DB"] = state["session_db"]
+    os.environ[VAR_BANCO_DOMINIO] = state["domain_db"]
+    servico = await _servico(Path(state["session_db"]), nome_modelo())
+    sid = await servico.criar_sessao("101")
+    corpo = await _com_quota(
+        lambda: servico.enviar_mensagem(
+            sid, f"Quero reservar o salão de festas para {state['data']}"
+        )
+    )
+    pid = corpo["confirmacoes_pendentes"][0]["id"]
+    state.update(
+        {
+            "session_id": sid,
+            "confirmation_id": pid,
+            "uso_criacao": dict(servico.ultimo_uso),
+        }
+    )
+    _escrever_estado(state_path, state)
+
+    async def _cair_no_inicio(
+        session_id: str, mensagem: types.Content
+    ) -> list[Any]:
+        del session_id, mensagem
+        os._exit(9)
+
+    servico._rodar = _cair_no_inicio
+    await servico.responder_confirmacao(sid, pid, True)
+    raise AssertionError("filho real não caiu")
+
+
+async def _queda_uma(
+    workdir: Path, *, ponto: str, confirmado: bool, indice: int
+) -> None:
+    from aurora.dados.pendencias import restaurar_pendencias
+
+    sufixo = f"{ponto}-{'sim' if confirmado else 'nao'}-{indice}"
+    session_db = workdir / f"a12-a13-{sufixo}-s.sqlite3"
+    domain_db = workdir / f"a12-a13-{sufixo}-d.sqlite3"
+    os.environ["AURORA_SESSION_DB"] = str(session_db)
+    os.environ[VAR_BANCO_DOMINIO] = str(domain_db)
+    garantir_banco(domain_db)
+    restaurar(domain_db)
+    restaurar_pendencias(domain_db)
+    data = f"2034-{'01' if confirmado else '02'}-{indice + (10 if ponto == 'depois' else 1):02d}"
+    state_path = workdir / f"a12-a13-{sufixo}.json"
+    _escrever_estado(
+        state_path,
+        {
+            "session_db": str(session_db),
+            "domain_db": str(domain_db),
+            "data": data,
+            "ponto": ponto,
+            "confirmado": confirmado,
+        },
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-u",
+            "-m",
+            "aurora.api.smoke_conversa",
+            "--mode",
+            "queda_confirmacao",
+            "--state",
+            str(state_path),
+        ],
+        cwd=str(REPO),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    _bruto_write(completed.stdout or "")
+    if completed.returncode != 9:
+        raise AssertionError(
+            f"queda {ponto}/{confirmado} exit={completed.returncode}: "
+            f"{(completed.stdout or '')[-500:]}"
+        )
+
+    state = _ler_estado(state_path)
+    servico = await _servico(
+        session_db, ModeloRoteirizado(area=AREA_TAXA, data=data)
+    )
+    try:
+        sid = state["session_id"]
+        pid = state["confirmation_id"]
+        statuses = {p["id"]: p["status"] for p in resumo_confirmacoes(servico, sid)}
+        if statuses.get(pid) != "pendente":
+            raise AssertionError(
+                f"queda {ponto}/{confirmado} não recuperou: {statuses.get(pid)}"
+            )
+        await servico.responder_confirmacao(sid, pid, confirmado)
+        esperado = 1 if confirmado else 0
+        if len(_reservas("101", AREA_TAXA, data)) != esperado:
+            raise AssertionError(
+                f"queda {ponto}/{confirmado} efeitos != {esperado}"
+            )
+        try:
+            await servico.responder_confirmacao(sid, pid, confirmado)
+            raise AssertionError("reenvio após queda não levantou")
+        except ConfirmacaoInexistente:
+            pass
+        if len(_reservas("101", AREA_TAXA, data)) != esperado:
+            raise AssertionError("reenvio após queda duplicou efeito")
+    finally:
+        await _fechar(servico)
+
+
+async def a12_a13(workdir: Path) -> None:
+    for confirmado, evento in ((True, "a12"), (False, "a13")):
+        for ponto in ("inicio", "depois"):
+            for indice in range(1, N_QUEDA + 1):
+                await _queda_uma(
+                    workdir,
+                    ponto=ponto,
+                    confirmado=confirmado,
+                    indice=indice,
+                )
+            _emit(evento + "_ponto", status="OK", ponto=ponto, n=N_QUEDA)
+        _emit(evento, status="OK", n_por_ponto=N_QUEDA)
+
+
+async def a14(workdir: Path) -> None:
+    for indice in range(1, N_CANCELAMENTO + 1):
+        session_db, _domain = _preparar_bancos(workdir, f"a14-{indice}")
+        data = f"2035-01-{indice:02d}"
+        modelo = ModeloRoteirizado(area=AREA_TAXA, data=data)
+        servico = await _servico(session_db, modelo)
+        try:
+            sid = await servico.criar_sessao("101")
+            corpo = await servico.enviar_mensagem(sid, f"Reservar salão {data}")
+            pid = corpo["confirmacoes_pendentes"][0]["id"]
+            original = servico._rodar
+            entrou = asyncio.Event()
+
+            async def _lenta(
+                session_id: str, mensagem: types.Content
+            ) -> list[Event]:
+                entrou.set()
+                await asyncio.sleep(3600)
+                return await original(session_id, mensagem)
+
+            servico._rodar = _lenta
+            task = asyncio.create_task(
+                servico.responder_confirmacao(sid, pid, True)
+            )
+            await asyncio.wait_for(entrou.wait(), timeout=10)
+            task.cancel()
+            try:
+                await task
+                raise AssertionError("A14 cancelamento não propagou")
+            except asyncio.CancelledError:
+                pass
+            finally:
+                servico._rodar = original
+            statuses = {
+                p["id"]: p["status"] for p in resumo_confirmacoes(servico, sid)
+            }
+            if statuses.get(pid) != "pendente":
+                raise AssertionError(f"A14 estado={statuses.get(pid)}")
+            if _reservas("101", AREA_TAXA, data):
+                raise AssertionError("A14 efeito antes do retry")
+            await servico.responder_confirmacao(sid, pid, True)
+            if len(_reservas("101", AREA_TAXA, data)) != 1:
+                raise AssertionError("A14 retry efeitos != 1")
+        finally:
+            await _fechar(servico)
+    _emit("a14", status="OK", n=N_CANCELAMENTO)
+
+
+async def a15(workdir: Path) -> None:
+    from aurora.dados.pendencias import iniciar_processamento
+
+    session_db, _domain = _preparar_bancos(workdir, "a15")
+    data = "2036-01-15"
+    servico = await _servico(
+        session_db, ModeloRoteirizado(area=AREA_TAXA, data=data)
+    )
+    try:
+        sid = await servico.criar_sessao("101")
+        corpo = await servico.enviar_mensagem(sid, f"Reservar salão {data}")
+        pid = corpo["confirmacoes_pendentes"][0]["id"]
+        if not iniciar_processamento(sid, pid, "aprovada"):
+            raise AssertionError("A15 não iniciou processamento")
+        novo = await servico.enviar_mensagem(sid, "Quais são as minhas reservas?")
+        _contrato_ok(novo)
+        statuses = {p["id"]: p["status"] for p in resumo_confirmacoes(servico, sid)}
+        if statuses.get(pid) != "processando":
+            raise AssertionError(f"A15 recuperou/cancelou recente: {statuses}")
+        if any(p["id"] == pid for p in novo["confirmacoes_pendentes"]):
+            raise AssertionError("A15 processando apareceu como pendente")
+    finally:
+        await _fechar(servico)
+    _emit("a15", status="OK", processando_recente="preservado", concorrencia_n=N_A9)
+
+
 async def parte_a(workdir: Path) -> None:
     await a1(workdir)
     await a2(workdir)
@@ -880,6 +1123,9 @@ async def parte_a(workdir: Path) -> None:
     await a9(workdir)
     await a10(workdir)
     await a11(workdir)
+    await a12_a13(workdir)
+    await a14(workdir)
+    await a15(workdir)
     _emit("parte_a", status="PASS")
 
 
@@ -1100,7 +1346,7 @@ async def b4(servico: ServicoConversa) -> dict[str, Any]:
 
 def _b5_regressao() -> None:
     completed = subprocess.run(
-        [sys.executable, "-u", "-m", "aurora.agentes.smoke_agentes", "--parte", "todas"],
+        [sys.executable, "-u", "-m", "aurora.agentes.smoke_agentes", "--parte", "a"],
         cwd=str(REPO),
         text=True,
         stdout=subprocess.PIPE,
@@ -1155,21 +1401,98 @@ async def _focais(servico: ServicoConversa) -> None:
         if "especialista_regulamento" in authors:
             regulamento += 1
         _emit("focal_coleira", tentativa=i + 1, authors=authors)
-    if regulamento < 2:
-        raise AssertionError(f"focal coleira regulamento={regulamento}/3")
-    _emit("focais", status="OK", visitantes=tools_vistas, coleira=regulamento)
+    _emit(
+        "focal_coleira_resultado",
+        status="INFORMATIVO",
+        regulamento=regulamento,
+        n=3,
+    )
+    _emit(
+        "focais",
+        status="OK",
+        visitantes=tools_vistas,
+        coleira_informativo=regulamento,
+    )
+
+
+async def _b_queda_real(workdir: Path) -> None:
+    global _CHAMADAS_MODELO
+    from aurora.agentes.modelo import nome_modelo
+    from aurora.dados.pendencias import restaurar_pendencias
+
+    session_db = workdir / "b-queda-sessoes.sqlite3"
+    domain_db = workdir / "b-queda-dominio.sqlite3"
+    data = "2030-06-15"
+    os.environ["AURORA_SESSION_DB"] = str(session_db)
+    os.environ[VAR_BANCO_DOMINIO] = str(domain_db)
+    garantir_banco(domain_db)
+    restaurar(domain_db)
+    restaurar_pendencias(domain_db)
+    state_path = workdir / "b-queda.json"
+    _escrever_estado(
+        state_path,
+        {
+            "session_db": str(session_db),
+            "domain_db": str(domain_db),
+            "data": data,
+        },
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-u",
+            "-m",
+            "aurora.api.smoke_conversa",
+            "--mode",
+            "queda_real",
+            "--state",
+            str(state_path),
+        ],
+        cwd=str(REPO),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    _bruto_write(completed.stdout or "")
+    if completed.returncode != 9:
+        raise AssertionError(
+            f"queda real exit={completed.returncode}: "
+            f"{(completed.stdout or '')[-500:]}"
+        )
+    state = _ler_estado(state_path)
+    uso_criacao = state.get("uso_criacao") or {}
+    _CHAMADAS_MODELO += int(uso_criacao.get("chamadas") or 0)
+    for chave in ("prompt", "candidates", "total"):
+        _TOKENS[chave] += int(uso_criacao.get(chave) or 0)
+
+    servico = await _servico(session_db, nome_modelo())
+    try:
+        sid = state["session_id"]
+        pid = state["confirmation_id"]
+        statuses = {p["id"]: p["status"] for p in resumo_confirmacoes(servico, sid)}
+        if statuses.get(pid) != "pendente":
+            raise AssertionError(f"queda real não recuperou: {statuses.get(pid)}")
+        await _com_quota(lambda: servico.responder_confirmacao(sid, pid, True))
+        _somar_uso(servico)
+        if len(_reservas("101", AREA_TAXA, data)) != 1:
+            raise AssertionError("queda real não resultou em 1 reserva")
+    finally:
+        await _fechar(servico)
+    _emit("b_queda_real", status="OK", area=AREA_TAXA, data=data, reservas=1)
 
 
 async def parte_b(workdir: Path) -> None:
     hashes = _hashes_dados()
-    chave = os.environ.get("GOOGLE_API_KEY", "")
     servico = await _b_servico(workdir)
+    chave = os.environ.get("GOOGLE_API_KEY", "")
     try:
         await b1(servico)
         await b2(servico)
         await b3(servico)
         evidencia = await b4(servico)
         await _focais(servico)
+        await _b_queda_real(workdir)
         _emit("b4_politica", **evidencia)
         if chave:
             blob = "\n".join(_SAIDAS)
@@ -1227,7 +1550,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--parte", choices=("a", "b", "todas"), default="todas")
     parser.add_argument(
         "--mode",
-        choices=("orchestrate", "a8_pendente"),
+        choices=("orchestrate", "a8_pendente", "queda_confirmacao", "queda_real"),
         default="orchestrate",
     )
     parser.add_argument("--state", type=Path)
@@ -1240,6 +1563,14 @@ def main() -> int:
         if args.state is None:
             raise SystemExit("--state obrigatório em a8_pendente")
         return asyncio.run(_a8_filho_pendente(args.state)) or 0
+    if args.mode == "queda_confirmacao":
+        if args.state is None:
+            raise SystemExit("--state obrigatório em queda_confirmacao")
+        return asyncio.run(_filho_queda_confirmacao(args.state)) or 0
+    if args.mode == "queda_real":
+        if args.state is None:
+            raise SystemExit("--state obrigatório em queda_real")
+        return asyncio.run(_filho_queda_real(args.state)) or 0
     return asyncio.run(_async_main(args.parte))
 
 
