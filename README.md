@@ -1,6 +1,6 @@
 # Aurora: assistente virtual do Residencial Aurora
 
-Assistente em Google ADK (série 2, versão fixada em 2.9.2) exposto por uma API FastAPI em `http://localhost:8000`. O modelo conduz a conversa; as regras críticas ficam no código e continuam valendo seja qual for o texto do morador.
+Assistente em Google ADK (série 2, versão exata 2.9.2 fixada em [pyproject.toml](pyproject.toml) e [uv.lock](uv.lock)) exposto por uma API FastAPI em `http://localhost:8000`. O modelo conduz a conversa; as regras críticas ficam no código e continuam valendo seja qual for o texto do morador.
 
 ## Arquitetura
 
@@ -27,7 +27,7 @@ flowchart LR
 
 Todos usam `gemini-3.5-flash` por padrão (`AURORA_MODEL` troca). As instruções estão em [instrucoes.py](src/aurora/agentes/instrucoes.py). Tools de reservas, visitantes e regulamento em [src/aurora/tools/](src/aurora/tools/); dados em [src/aurora/dados/](src/aurora/dados/); rotas em [app.py](src/aurora/api/app.py) e regras de conversa em [conversa.py](src/aurora/api/conversa.py).
 
-Armazenamento: dois arquivos SQLite em `var/`. `dominio.sqlite3` guarda reservas, visitantes e pendências de confirmação; `sessions.sqlite3` guarda as sessões do ADK. Rode a API com **um único worker** (é o que `scripts/subir.py` faz): o serializador de eventos assume um processo escritor por sessão.
+Armazenamento: dois arquivos SQLite em `var/`. `dominio.sqlite3` guarda reservas, visitantes e pendências de confirmação; `sessions.sqlite3` guarda as sessões do ADK. Rode a API com **um único processo**: `scripts/subir.py` usa o padrão do uvicorn (um processo), então não passe `--workers`. O serializador de eventos assume um processo escritor por sessão.
 
 ## Garantias
 
@@ -42,7 +42,7 @@ Cada garantia aponta onde está o código e por que não depende do que o modelo
 
 ### 2. Cada sessão pertence a um apartamento
 
-- O apartamento entra uma vez, no `state` da sessão ([conversa.py](src/aurora/api/conversa.py#L244)). Nenhuma tool tem parâmetro de apartamento: todas leem `tool_context.state` ([`_apartamento_da_sessao`](src/aurora/tools/reservas.py#L73) e [`_sessao_valida`](src/aurora/tools/reservas.py#L84)).
+- O apartamento entra uma vez, no `state` da sessão ([conversa.py](src/aurora/api/conversa.py#L244)). Nenhuma tool tem parâmetro de apartamento. As que leem ou gravam dados do morador (`reservar_area`, `cancelar_reserva`, `listar_minhas_reservas`, `autorizar_visitante`, `listar_meus_visitantes`) obtêm o apartamento de `tool_context.state` ([`_apartamento_da_sessao`](src/aurora/tools/reservas.py#L73) e [`_sessao_valida`](src/aurora/tools/reservas.py#L84)). `consultar_disponibilidade` e `consultar_regulamento` não leem a sessão: não recebem nem devolvem dado de apartamento.
 - Reserva de outro apartamento e reserva inexistente dão a mesma resposta (`nao_encontrada`) em [`cancelar_reserva`](src/aurora/tools/reservas.py#L157). [`consultar_disponibilidade`](src/aurora/tools/reservas.py#L106) devolve só livre ou ocupada, nunca de quem é.
 - As instruções reforçam a recusa, mas a garantia é estrutural: mesmo que o modelo aceite a história "sou do 302", a tool continua lendo o apartamento da sessão.
 
@@ -54,14 +54,14 @@ Cada garantia aponta onde está o código e por que não depende do que o modelo
 
 ### 4. O regulamento é consultado, não carregado
 
-- A raiz não tem tools nem regulamento no prompt ([principal.py](src/aurora/agentes/principal.py#L38)).
+- A raiz não tem tools ([principal.py](src/aurora/agentes/principal.py#L38)) e o regulamento não está nas suas instruções: [`INSTRUCAO_PRINCIPAL`](src/aurora/agentes/instrucoes.py#L33) só descreve para quem transferir.
 - [`consultar_regulamento`](src/aurora/tools/regulamento.py#L747) busca por relevância e devolve no máximo [3 trechos](src/aurora/tools/regulamento.py#L32). Só esses trechos entram nos eventos; o arquivo inteiro nunca vai para o histórico.
-- Limite honesto: a busca é lexical, então o que entra nos eventos é o que ela ranqueia como relevante; ela erra para frases muito indiretas (medições no ledger do projeto).
+- Limite honesto: a busca é lexical, então o que entra nos eventos é o que ela ranqueia como relevante; ela erra para frases muito indiretas, por isso o especialista reformula a pergunta com termos formais do regulamento ([`INSTRUCAO_REGULAMENTO`](src/aurora/agentes/instrucoes.py#L101)).
 
 ### 5. Dois moradores, uma reserva
 
 - A exclusividade vale no instante da gravação: índice `UNIQUE` parcial [`ux_reservas_ativa`](src/aurora/dados/dominio.py#L112) sobre `(area, data) WHERE ativa=1`. [`gravar_reserva`](src/aurora/dados/dominio.py#L261) captura o `IntegrityError` ([L290](src/aurora/dados/dominio.py#L290)) e devolve `recusada` como resposta normal.
-- O spike [`spike_concorrencia/`](spike_concorrencia/RESULTADO-CONCORRENCIA.md) comparou estratégias: SELECT seguido de INSERT e lock em memória falham sob concorrência; o índice único e `BEGIN IMMEDIATE` tiveram 0 falhas em 3 rodadas.
+- O spike [`spike_concorrencia/`](spike_concorrencia/RESULTADO-CONCORRENCIA.md) comparou estratégias: SELECT seguido de INSERT e lock em memória falham sob concorrência; o índice único e `BEGIN IMMEDIATE` tiveram 0 falhas em 3 rodadas. A API usa o índice único (a gravação roda em `BEGIN`, sem `BEGIN IMMEDIATE`).
 - A tool só converte a recusa em texto; quem decide é o banco.
 
 ## Como rodar
@@ -91,12 +91,13 @@ Comandos úteis:
 - **Restaurar dados:** `uv run python scripts/restaurar.py`. Preserva as sessões. Com `--sessoes` apaga também o banco de sessões (a API precisa estar parada). A sequência de códigos de reserva não regride.
 - **Reiniciar sem perder nada:** pare com Ctrl+C e rode `scripts/subir.py` de novo, sem restaurar.
 - **Verificar os dados iniciais:** `uv run python -m aurora.dados.carregar --verificar`.
+- **Dados do condomínio:** `dados/` é o estado inicial e a aplicação nunca o altera (hashes em [PROTECTED-MANIFEST.json](PROTECTED-MANIFEST.json)). O `.env` está no `.gitignore`; o `.env.example` só traz nomes.
 - **Verificação das rotas sem chamar o modelo:** `uv run python -m aurora.api.smoke_rotas` (usa um modelo falso e bancos temporários).
 
 Rotas: `POST /sessoes`, `POST /sessoes/{id}/mensagens`, `POST /sessoes/{id}/confirmacoes`, `GET /sessoes/{id}/eventos`, `GET /apartamentos/{n}/reservas`, `GET /apartamentos/{n}/visitantes`. As duas últimas leem o banco direto, sem modelo.
 
 ### Estado de validação
 
-- As rotas, a confirmação, o isolamento por apartamento e a disputa de reserva estão cobertos por um modelo falso ([smoke_rotas.py](src/aurora/api/smoke_rotas.py)) e foram reexecutados por revisão independente.
-- A conversa com o Gemini real foi validada ponta a ponta em 2026-09-25. Depois disso as instruções dos agentes foram ajustadas e a bateria com o Gemini real não foi repetida, porque a cota da chave de desenvolvimento acabou (erro 402). Rode o fluxo do avaliador com a sua chave antes de confiar no roteamento.
+- Cobertos pelo modelo falso ([smoke_rotas.py](src/aurora/api/smoke_rotas.py)), com bancos temporários: as rotas do contrato, a confirmação (pendência, negar, aprovar, reenvio e id inexistente com 409), a autorização de visitante, os eventos da sessão e a disputa pela mesma reserva. A reexecução independente confirmou o resultado. O isolamento por apartamento é estrutural (garantia 2) e não tem teste próprio no smoke.
+- O fluxo do avaliador com o Gemini real foi exercitado em 2026-09-25 (passos 3 a 14). Depois disso as instruções dos agentes foram ajustadas e esse fluxo não foi repetido, porque a cota da chave de desenvolvimento acabou (erro 402). Rode o fluxo do avaliador com a sua chave antes de confiar no roteamento.
 - Sem testes automatizados além dos roteiros de smoke em `src/aurora/**/smoke_*.py`, conforme o escopo do enunciado.
