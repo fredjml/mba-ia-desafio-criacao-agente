@@ -5,3 +5,4 @@ var/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+spike_confirmacao/adk_antigo/
