@@ -16,6 +16,7 @@ from typing import Any
 from weakref import WeakValueDictionary
 
 import asyncio
+import re
 
 from google.adk.errors import StaleSessionError
 from google.adk.events import Event
@@ -40,6 +41,10 @@ from aurora.runtime.fabrica import RuntimeMontado, montar_runtime
 APPROVAL_NAME = "adk_request_confirmation"
 USER_ID = "morador"
 LIMITE_PROCESSANDO_S = 300.0
+RESPOSTA_VAZIA = "Não consegui responder agora. Pode repetir o pedido?"
+RESPOSTA_OUTRO_APARTAMENTO = (
+    "Só posso atender o apartamento desta sessão. Não consulto nem altero dados de outra unidade."
+)
 
 
 class SessaoInexistente(Exception):
@@ -56,6 +61,14 @@ class ApartamentoInvalido(Exception):
 
 def _apartamentos_validos() -> set[str]:
     return {str(item["numero"]) for item in carregar_apartamentos()}
+
+
+def _cita_outro_apartamento(texto: str, proprio: str) -> bool:
+    """True se o texto traz, isolado, o número de um apartamento diferente do da sessão."""
+    for numero in _apartamentos_validos() - {proprio}:
+        if re.search(rf"(?<![\w\-./]){re.escape(numero)}(?![\w\-]|\.\d)", texto):
+            return True
+    return False
 
 
 def _args_dict(args: Any) -> dict[str, Any]:
@@ -230,10 +243,10 @@ class ServicoConversa:
             ],
         }
 
-    def _resposta_segura(self, session_id: str) -> dict[str, Any]:
+    def _resposta_segura(self, session_id: str, resposta: str = "") -> dict[str, Any]:
         self.ultimo_uso = {"prompt": 0, "candidates": 0, "total": 0, "chamadas": 0}
         self.ultimo_turno = {"authors": [], "tools": [], "texts": [], "text": ""}
-        return self._contrato(session_id, "")
+        return self._contrato(session_id, resposta)
 
     async def criar_sessao(self, apartamento: str) -> str:
         if str(apartamento) not in _apartamentos_validos():
@@ -257,7 +270,11 @@ class ServicoConversa:
             recuperar_processando(
                 session_id, mais_velho_que_s=LIMITE_PROCESSANDO_S
             )
-            await self._obter_sessao(session_id)
+            sessao = await self._obter_sessao(session_id)
+            # Fala que cita outro apartamento não chega ao modelo nem entra na sessão:
+            # evita que o histórico contamine os pedidos seguintes (recusa indevida).
+            if _cita_outro_apartamento(texto, str(sessao.state.get("apartamento") or "")):
+                return self._resposta_segura(session_id, RESPOSTA_OUTRO_APARTAMENTO)
             # D6: cancela na tabela e segue (sem negação sintética).
             # Evidência B4 (Gemini real, 2026-09-25): pendência aberta +
             # "Quais são as minhas reservas?" → resposta com RSV-1377 da
@@ -269,7 +286,25 @@ class ServicoConversa:
                 return self._resposta_segura(session_id)
             self._anotar_turno(events)
             self._registrar_novas(session_id, events)
-            return self._contrato(session_id, self.ultimo_turno.get("text") or "")
+            if self._turno_vazio(session_id):
+                # Sem texto, sem pendência e sem tool executada: refazer não duplica efeito.
+                try:
+                    events = await self._rodar(session_id, _mensagem_texto(texto))
+                except (ValueError, StaleSessionError):
+                    return self._resposta_segura(session_id)
+                self._anotar_turno(events)
+                self._registrar_novas(session_id, events)
+            resposta = self.ultimo_turno.get("text") or ""
+            if self._turno_vazio(session_id):
+                resposta = RESPOSTA_VAZIA
+            return self._contrato(session_id, resposta)
+
+    def _turno_vazio(self, session_id: str) -> bool:
+        return (
+            not self.ultimo_turno.get("text")
+            and not self.ultimo_turno.get("tools")
+            and not listar_pendentes(session_id)
+        )
 
     async def responder_confirmacao(
         self, session_id: str, id: str, confirmado: bool

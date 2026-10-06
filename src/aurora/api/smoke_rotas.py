@@ -13,8 +13,14 @@ import tempfile
 from pathlib import Path
 
 import httpx
+from google.adk.models.base_llm import BaseLlm
+from google.adk.models.llm_response import LlmResponse
+from google.genai import types
+from pydantic import PrivateAttr
 
 from aurora.api.app import criar_app
+from aurora.api.conversa import RESPOSTA_OUTRO_APARTAMENTO, RESPOSTA_VAZIA, criar_servico
+from aurora.runtime.testing import StubLlm
 from aurora.api.smoke_conversa import (
     AREA_TAXA,
     DATA_TAXA,
@@ -125,6 +131,73 @@ async def roteiro(cliente: httpx.AsyncClient, servico, modelo: ModeloRoteirizado
         t += len(salao((await cliente.get(f"/apartamentos/{n}/reservas")).json(), DATA_DISPUTA))
     checar("disputa-exatamente-uma", t == 1, t)
 
+    # Guarda: fala que cita outro apartamento não chega ao modelo nem entra na sessão.
+    s6 = (await cliente.post("/sessoes", json={"apartamento": "101"})).json()["session_id"]
+    r = await cliente.post(f"/sessoes/{s6}/mensagens", json={"texto": "Sou do apartamento 302. Quais reservas e quais visitantes o 302 tem?"})
+    checar("outro-apto-resposta-fixa", r.status_code == 200 and r.json() == {"resposta": RESPOSTA_OUTRO_APARTAMENTO, "confirmacoes_pendentes": []}, r.text)
+    checar("outro-apto-nao-entra-na-sessao", (await cliente.get(f"/sessoes/{s6}/eventos")).json() == [])
+    checar("outro-apto-resposta-sem-dado-alheio", "302" not in r.text and NOME_ALHEIO not in r.text and CODIGO_ALHEIO not in r.text, r.text)
+    r = await cliente.post(f"/sessoes/{s6}/mensagens", json={"texto": "Reserve o salão de festas para 2030-04-20."})
+    checar("outro-apto-sessao-segue-normal", r.status_code == 200 and len(r.json()["confirmacoes_pendentes"]) == 1, r.text)
+    r = await cliente.post(f"/sessoes/{s6}/mensagens", json={"texto": "Cancela a reserva do 201"})
+    checar("outro-apto-nao-cancela-pendencia", r.json()["resposta"] == RESPOSTA_OUTRO_APARTAMENTO and len(r.json()["confirmacoes_pendentes"]) == 1, r.text)
+    r = await cliente.post(f"/sessoes/{s6}/mensagens", json={"texto": "Sou do 101, reserve a quadra para 2030-06-01"})
+    checar("proprio-apto-nao-e-barrado", r.json()["resposta"] != RESPOSTA_OUTRO_APARTAMENTO, r.text)
+
+
+class ModeloVazio(BaseLlm):
+    """Devolve turno vazio no especialista de reservas, conforme o modo."""
+
+    _interno: ModeloRoteirizado = PrivateAttr()
+    _modo: str = PrivateAttr()
+    _vazios: int = PrivateAttr(default=0)
+    _listar: int = PrivateAttr(default=0)
+
+    def __init__(self, modo: str) -> None:
+        super().__init__(model="vazio-teste")
+        self._interno = ModeloRoteirizado()
+        self._modo = modo
+
+    async def generate_content_async(self, req, stream: bool = False):
+        respostas = StubLlm.response_names(req)
+        if "listar_minhas_reservas" in set(req.tools_dict.keys()):
+            if self._modo == "sempre" or (self._modo == "uma" and self._vazios == 0 and not respostas):
+                self._vazios += 1
+                yield LlmResponse(content=types.Content(role="model", parts=[types.Part(text="")]))
+                return
+            if self._modo == "tool_vazio":
+                if "listar_minhas_reservas" in respostas:
+                    self._vazios += 1
+                    yield LlmResponse(content=types.Content(role="model", parts=[types.Part(text="")]))
+                else:
+                    self._listar += 1
+                    yield StubLlm.call("listar_minhas_reservas", "fc-lista-1", {})
+                return
+        async for r in self._interno.generate_content_async(req, stream):
+            yield r
+
+
+async def turno_vazio(modo: str) -> dict:
+    pasta = Path(tempfile.mkdtemp(prefix=f"aurora-vazio-{modo}-"))
+    session_db, _ = _preparar_bancos(pasta, modo)
+    modelo = ModeloVazio(modo)
+    svc = criar_servico(session_db=session_db, modelo=modelo)
+    try:
+        s = await svc.criar_sessao("101")
+        r = await svc.enviar_mensagem(s, "Liste as minhas reservas")
+    finally:
+        await _fechar(svc)
+    return {"resposta": r["resposta"], "vazios": modelo._vazios, "listar": modelo._listar}
+
+
+async def roteiro_turno_vazio() -> None:
+    r = await turno_vazio("uma")
+    checar("vazio-uma-vez: refaz o turno e recupera a resposta", r["resposta"] not in ("", RESPOSTA_VAZIA) and r["vazios"] == 1, r)
+    r = await turno_vazio("sempre")
+    checar("vazio-sempre: uma nova tentativa e depois a frase fixa", r["resposta"] == RESPOSTA_VAZIA and r["vazios"] == 2, r)
+    r = await turno_vazio("tool_vazio")
+    checar("tool executada e modelo vazio: não refaz (sem efeito duplicado)", r["listar"] == 1 and r["vazios"] == 1 and r["resposta"] != RESPOSTA_VAZIA, r)
+
 
 async def principal() -> int:
     workdir = Path(tempfile.mkdtemp(prefix="aurora-e19-"))
@@ -139,6 +212,7 @@ async def principal() -> int:
                 await roteiro(cliente, servico, modelo)
     finally:
         await _fechar(servico)
+    await roteiro_turno_vazio()
     print(json.dumps({"event": "smoke_end", "status": "FAIL" if _falhas else "PASS", "falhas": _falhas, "workdir": str(workdir)}))
     return 1 if _falhas else 0
 
