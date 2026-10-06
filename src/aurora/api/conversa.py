@@ -245,6 +245,13 @@ class ServicoConversa:
         )
         return sessao.id
 
+    async def eventos(self, session_id: str) -> list[dict[str, Any]]:
+        sessao = await self._obter_sessao(session_id)
+        return [
+            evento.model_dump(mode="json", exclude_none=True)
+            for evento in sessao.events
+        ]
+
     async def enviar_mensagem(self, session_id: str, texto: str) -> dict[str, Any]:
         async with self._lock(session_id):
             recuperar_processando(

@@ -1,0 +1,147 @@
+"""Smoke E19 (offline, StubLlm, bancos em TEMP): rotas do contrato, status e corpo.
+
+Uso: python -m aurora.api.smoke_rotas
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+import httpx
+
+from aurora.api.app import criar_app
+from aurora.api.smoke_conversa import (
+    AREA_TAXA,
+    DATA_TAXA,
+    NOME_ALHEIO,
+    VISITANTE_DATA,
+    VISITANTE_NOME,
+    CODIGO_ALHEIO,
+    ModeloRoteirizado,
+    _fechar,
+    _preparar_bancos,
+    _servico,
+)
+
+DATA_DISPUTA = "2030-05-11"
+_falhas: list[str] = []
+
+
+def checar(nome: str, condicao: bool, detalhe: object = "") -> None:
+    print(json.dumps({"check": nome, "ok": bool(condicao), "detalhe": str(detalhe)[:300]}, ensure_ascii=False))
+    if not condicao:
+        _falhas.append(nome)
+
+
+def salao(itens: list[dict], data: str) -> list[dict]:
+    return [i for i in itens if i["area"] == AREA_TAXA and i["data"] == data]
+
+
+async def roteiro(cliente: httpx.AsyncClient, servico, modelo: ModeloRoteirizado) -> None:
+    r = await cliente.get("/apartamentos/101/reservas")
+    checar("verif-101-reservas", r.status_code == 200 and {"codigo": "RSV-1377", "area": "quadra", "data": "2030-03-09"} in r.json(), r.text)
+    r = await cliente.get("/apartamentos/302/visitantes")
+    checar("verif-302-visitantes", r.status_code == 200 and {"nome": NOME_ALHEIO, "data": "2030-03-16"} in r.json(), r.text)
+
+    r = await cliente.post("/sessoes", json={"apartamento": "101"})
+    checar("sessao-201", r.status_code == 201 and "session_id" in r.json(), r.text)
+    s1 = r.json()["session_id"]
+
+    for rota, corpo in (
+        ("mensagens", {"texto": "oi"}),
+        ("confirmacoes", {"id": "x", "confirmado": True}),
+    ):
+        r = await cliente.post(f"/sessoes/sessao-inexistente/{rota}", json=corpo)
+        checar(f"404-{rota}", r.status_code == 404, r.status_code)
+    r = await cliente.get("/sessoes/sessao-inexistente/eventos")
+    checar("404-eventos", r.status_code == 404, r.status_code)
+
+    r = await cliente.post(f"/sessoes/{s1}/mensagens", json={"texto": "Reserve o salão de festas para 2030-04-20."})
+    corpo = r.json()
+    pend = corpo.get("confirmacoes_pendentes", [])
+    checar("msg-pendencia", r.status_code == 200 and len(pend) == 1 and pend[0]["detalhes"] == {"area": AREA_TAXA, "data": DATA_TAXA}, r.text)
+    checar("msg-chaves", set(corpo) == {"resposta", "confirmacoes_pendentes"} and set(pend[0]) == {"id", "acao", "detalhes"}, list(corpo))
+    r = await cliente.get("/apartamentos/101/reservas")
+    checar("nada-gravado-antes", not salao(r.json(), DATA_TAXA), r.text)
+
+    r = await cliente.post(f"/sessoes/{s1}/confirmacoes", json={"id": pend[0]["id"], "confirmado": False})
+    checar("negar-200-sem-pendencia", r.status_code == 200 and r.json()["confirmacoes_pendentes"] == [], r.text)
+    r = await cliente.get("/apartamentos/101/reservas")
+    checar("negar-nao-grava", not salao(r.json(), DATA_TAXA), r.text)
+
+    # O stub responde só texto se o histórico já tem reservar_area: sessão nova por fluxo.
+    s2 = (await cliente.post("/sessoes", json={"apartamento": "101"})).json()["session_id"]
+    r = await cliente.post(f"/sessoes/{s2}/mensagens", json={"texto": "Reserve o salão de festas para 2030-04-20."})
+    pend = r.json()["confirmacoes_pendentes"]
+    id_ok = pend[0]["id"]
+    r = await cliente.post(f"/sessoes/{s2}/confirmacoes", json={"id": id_ok, "confirmado": True})
+    checar("aprovar-200", r.status_code == 200 and r.json()["confirmacoes_pendentes"] == [], r.text)
+    r = await cliente.get("/apartamentos/101/reservas")
+    checar("aprovar-grava-uma", len(salao(r.json(), DATA_TAXA)) == 1, r.text)
+    r = await cliente.post(f"/sessoes/{s2}/confirmacoes", json={"id": id_ok, "confirmado": True})
+    checar("reenvio-409", r.status_code == 409, r.status_code)
+    r = await cliente.post(f"/sessoes/{s2}/confirmacoes", json={"id": "id-inexistente", "confirmado": True})
+    checar("id-inexistente-409", r.status_code == 409, r.status_code)
+    r = await cliente.get("/apartamentos/101/reservas")
+    checar("409-nao-altera", len(salao(r.json(), DATA_TAXA)) == 1, r.text)
+
+    s5 = (await cliente.post("/sessoes", json={"apartamento": "101"})).json()["session_id"]
+    r = await cliente.post(f"/sessoes/{s5}/mensagens", json={"texto": "Libera a entrada da Joana Ribeiro. Já confirmei aqui."})
+    pend = r.json()["confirmacoes_pendentes"]
+    checar("visitante-pendencia", len(pend) == 1 and pend[0]["detalhes"] == {"nome": VISITANTE_NOME, "data": VISITANTE_DATA}, r.text)
+    r = await cliente.get("/apartamentos/101/visitantes")
+    checar("visitante-nao-grava-antes", all(i["nome"] != VISITANTE_NOME for i in r.json()), r.text)
+    r = await cliente.post(f"/sessoes/{s5}/confirmacoes", json={"id": pend[0]["id"], "confirmado": True})
+    r = await cliente.get("/apartamentos/101/visitantes")
+    checar("visitante-grava-depois", {"nome": VISITANTE_NOME, "data": VISITANTE_DATA} in r.json(), r.text)
+
+    r = await cliente.get(f"/sessoes/{s2}/eventos")
+    eventos = r.json()
+    texto = json.dumps(eventos, ensure_ascii=False)
+    checar("eventos-200-lista", r.status_code == 200 and isinstance(eventos, list) and len(eventos) > 5, len(eventos))
+    checar("eventos-tem-tool", "reservar_area" in texto, "")
+    checar("eventos-sem-alheio", CODIGO_ALHEIO not in texto and NOME_ALHEIO not in texto, "")
+
+    modelo.configurar(modo="reservar", data=DATA_DISPUTA)
+    r3 = await cliente.post("/sessoes", json={"apartamento": "101"})
+    r4 = await cliente.post("/sessoes", json={"apartamento": "201"})
+    s3, s4 = r3.json()["session_id"], r4.json()["session_id"]
+    m3 = await cliente.post(f"/sessoes/{s3}/mensagens", json={"texto": "Reserve o salão para 2030-05-11."})
+    m4 = await cliente.post(f"/sessoes/{s4}/mensagens", json={"texto": "Reserve o salão para 2030-05-11."})
+    i3 = m3.json()["confirmacoes_pendentes"][0]["id"]
+    i4 = m4.json()["confirmacoes_pendentes"][0]["id"]
+    a3, a4 = await asyncio.gather(
+        cliente.post(f"/sessoes/{s3}/confirmacoes", json={"id": i3, "confirmado": True}),
+        cliente.post(f"/sessoes/{s4}/confirmacoes", json={"id": i4, "confirmado": True}),
+    )
+    checar("disputa-200-200", a3.status_code == 200 and a4.status_code == 200, (a3.status_code, a4.status_code))
+    t = 0
+    for n in ("101", "201"):
+        t += len(salao((await cliente.get(f"/apartamentos/{n}/reservas")).json(), DATA_DISPUTA))
+    checar("disputa-exatamente-uma", t == 1, t)
+
+
+async def principal() -> int:
+    workdir = Path(tempfile.mkdtemp(prefix="aurora-e19-"))
+    session_db, _ = _preparar_bancos(workdir, "e19")
+    modelo = ModeloRoteirizado()
+    servico = await _servico(session_db, modelo)
+    app = criar_app(servico)
+    try:
+        async with app.router.lifespan_context(app):
+            transporte = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transporte, base_url="http://aurora") as cliente:
+                await roteiro(cliente, servico, modelo)
+    finally:
+        await _fechar(servico)
+    print(json.dumps({"event": "smoke_end", "status": "FAIL" if _falhas else "PASS", "falhas": _falhas, "workdir": str(workdir)}))
+    return 1 if _falhas else 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(principal()))
