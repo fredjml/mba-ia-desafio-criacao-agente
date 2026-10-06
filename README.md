@@ -93,6 +93,7 @@ Comandos úteis:
 - **Verificar os dados iniciais:** `uv run python -m aurora.dados.carregar --verificar`.
 - **Dados do condomínio:** `dados/` é o estado inicial e a aplicação nunca o altera (hashes em [PROTECTED-MANIFEST.json](PROTECTED-MANIFEST.json)). O `.env` está no `.gitignore`; o `.env.example` só traz nomes.
 - **Verificação das rotas sem chamar o modelo:** `uv run python -m aurora.api.smoke_rotas` (usa um modelo falso e bancos temporários).
+- **Fluxo completo do avaliador (15 passos):** `uv run python scripts/verificar_fluxo.py --subir -v`. Restaura dados e sessões, sobe a API, reinicia no passo 13 e reporta OK ou FALHA por passo. Usa o Gemini real (algumas dezenas de chamadas); sem `--subir`, verifica uma API já no ar.
 
 Rotas: `POST /sessoes`, `POST /sessoes/{id}/mensagens`, `POST /sessoes/{id}/confirmacoes`, `GET /sessoes/{id}/eventos`, `GET /apartamentos/{n}/reservas`, `GET /apartamentos/{n}/visitantes`. As duas últimas leem o banco direto, sem modelo.
 
