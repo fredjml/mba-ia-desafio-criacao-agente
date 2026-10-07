@@ -470,11 +470,17 @@ def verificar_repositorio(p: Passo) -> None:
         lock = (RAIZ / "uv.lock").read_text(encoding="utf-8")
         p.checar("uv.lock com a mesma versão", re.search(rf'name = "google-adk"\s+version = "{re.escape(versao)}"', lock) is not None, versao)
 
-    base = next((r for r in ("upstream/main", "origin/main") if _git("rev-parse", "--verify", r).returncode == 0), None)
+    base = "upstream/main" if _git("rev-parse", "--verify", "upstream/main").returncode == 0 else None
+    rotulo = base
+    if base is None:
+        # Num clone do fork não há remoto upstream, e origin/main seria o próprio HEAD: usa o commit raiz, que é o do repositório base.
+        raizes = _git("rev-list", "--max-parents=0", "HEAD").stdout.split()
+        if raizes:
+            base, rotulo = raizes[-1], f"commit raiz {raizes[-1][:7]}"
     if base:
-        p.checar(f"dados/ idênticos aos de {base}", _git("diff", "--quiet", base, "--", "dados").returncode == 0)
+        p.checar(f"dados/ idênticos aos de {rotulo}", _git("diff", "--quiet", base, "--", "dados").returncode == 0)
     else:
-        p.checar("dados/ comparados com o repositório base", False, "sem remoto upstream/origin")
+        p.checar("dados/ comparados com o repositório base", False, "sem upstream/main nem commit raiz")
     p.checar("dados/ sem alteração local", _git("status", "--porcelain", "--", "dados").stdout.strip() == "")
 
     p.checar(".env não versionado", _git("ls-files", ".env").stdout.strip() == "")
