@@ -117,17 +117,17 @@ def chamadas_de_tool(eventos: list[dict]) -> set[str]:
     return nomes
 
 
-def execucoes_de_reserva(eventos: list[dict], data: str) -> int:
-    """Conta resultados de reservar_area que gravaram a data (reservada ou ja_reservada)."""
-    total = 0
+def resultados_de_reserva(eventos: list[dict], data: str) -> list[str]:
+    """Status de cada resultado de reservar_area que cita a data, na ordem dos eventos."""
+    status: list[str] = []
     for d in percorrer(eventos):
         for chave in ("function_response", "functionResponse"):
             r = d.get(chave)
             if isinstance(r, dict) and r.get("name") == "reservar_area":
                 for x in percorrer(r.get("response")):
-                    if x.get("data") == data and x.get("status") in ("reservada", "ja_reservada"):
-                        total += 1
-    return total
+                    if x.get("data") == data and x.get("status"):
+                        status.append(str(x["status"]))
+    return status
 
 
 class Servidor:
@@ -234,11 +234,11 @@ def executar(api: Api, servidor: Servidor | None, relatorio: list[Passo]) -> Non
         ctx["resps"].append((p.numero, corpo))
         return corpo
 
-    def responder(p: Passo, sessao: str, id_: str, ok: bool, nome: str) -> int:
+    def responder(p: Passo, sessao: str, id_: str, ok: bool, nome: str) -> tuple[int, Any]:
         status, corpo = api.confirmar(sessao, id_, ok)
         valido = isinstance(corpo, dict) and set(corpo) == CHAVES_CONTRATO
         p.checar(f"{nome}: 200 com o corpo do contrato", status == 200 and valido, f"{status} {str(corpo)[:120]}")
-        return status
+        return status, corpo
 
     def pendentes(corpo: dict) -> list[dict]:
         return list(corpo.get("confirmacoes_pendentes") or [])
@@ -315,7 +315,8 @@ def executar(api: Api, servidor: Servidor | None, relatorio: list[Passo]) -> Non
             return
         responder(p, ctx["s1"], pend["id"], True, "aprovar")
         p.checar("exatamente uma reserva do salão", len(salao(api.reservas("101"), "2030-04-20")) == 1, api.reservas("101"))
-        p.checar("a tool gravou a data exatamente uma vez nos eventos", execucoes_de_reserva(api.eventos(ctx["s1"]), "2030-04-20") == 1)
+        status_reserva = resultados_de_reserva(api.eventos(ctx["s1"]), "2030-04-20")
+        p.checar("a tool gravou a data uma vez, como 'reservada' (nenhum 'ja_reservada')", status_reserva == ["reservada"], status_reserva)
         status, _ = api.confirmar(ctx["s1"], pend["id"], True)
         p.checar("reenvio do mesmo id responde 409", status == 409, status)
         p.checar("continua exatamente uma", len(salao(api.reservas("101"), "2030-04-20")) == 1)
@@ -336,8 +337,7 @@ def executar(api: Api, servidor: Servidor | None, relatorio: list[Passo]) -> Non
         respostas = [texto_json(corpo)]
         pend = pendentes(corpo)
         if pend:
-            status, corpo2 = api.confirmar(s2, pend[0]["id"], True)
-            p.checar("aprovar a confirmação (se houve) responde 200", status == 200, status)
+            _, corpo2 = responder(p, s2, pend[0]["id"], True, "aprovar a confirmação (se houve)")
             respostas.append(texto_json(corpo2))
         todo = " ".join(respostas)
         r101 = api.reservas("101")
@@ -409,6 +409,13 @@ def executar(api: Api, servidor: Servidor | None, relatorio: list[Passo]) -> Non
         p.checar("as duas ficam com uma confirmação pendente", all(ids), ids)
         if not all(ids):
             return
+
+        def total_0511() -> int:
+            return len(salao(api.reservas("101"), "2030-05-11")) + len(salao(api.reservas("201"), "2030-05-11"))
+
+        cruzado = [api.confirmar(s4, ids[0], True)[0], api.confirmar(s3, ids[1], True)[0]]
+        p.checar("confirmar o id pendente de OUTRA sessão responde 409", cruzado == [409, 409], cruzado)
+        p.checar("as confirmações cruzadas não gravaram reserva", total_0511() == 0, total_0511())
         status: dict[str, int] = {}
 
         def aprovar(chave: str, sessao: str, id_: str) -> None:
@@ -420,8 +427,11 @@ def executar(api: Api, servidor: Servidor | None, relatorio: list[Passo]) -> Non
         for t in ts:
             t.join()
         p.checar("as duas aprovações simultâneas respondem 200", status == {"s3": 200, "s4": 200}, status)
-        total = len(salao(api.reservas("101"), "2030-05-11")) + len(salao(api.reservas("201"), "2030-05-11"))
+        total = total_0511()
         p.checar("exatamente uma reserva do salão em 2030-05-11", total == 1, total)
+        e3, e4 = api.eventos(s3), api.eventos(s4)
+        e1 = texto_json(api.eventos(ctx["s1"]))
+        p.checar("GET /eventos pertence à sessão: S1 não traz a conversa de S3 e S4; S3 e S4 trazem a sua", "2030-05-11" not in e1 and bool(e3) and bool(e4) and e3 != e4, f"S3={len(e3)} S4={len(e4)}")
 
     def p15(p: Passo) -> None:
         verificar_repositorio(p)
@@ -511,7 +521,7 @@ def verificar_repositorio(p: Passo) -> None:
             duplicadas = con.execute("SELECT area, data, COUNT(*) FROM reservas WHERE ativa=1 GROUP BY area, data HAVING COUNT(*) > 1").fetchall()
         finally:
             con.close()
-        p.checar("banco: índice único parcial ux_reservas_ativa presente", bool(indice) and "UNIQUE" in indice[0].upper() and "ativa" in indice[0], indice)
+        p.checar("banco: índice único parcial ux_reservas_ativa em (area, data) WHERE ativa=1", bool(indice) and "UNIQUE" in indice[0].upper() and re.search(r"\(\s*area\s*,\s*data\s*\)", indice[0]) is not None and re.search(r"WHERE\s+ativa\s*=\s*1", indice[0], re.I) is not None, indice)
         p.checar("banco: nenhuma área e data com duas reservas ativas", not duplicadas, duplicadas)
     else:
         p.checar("banco do domínio encontrado (defina AURORA_DOMAIN_DB igual ao da API)", False, str(banco))
@@ -521,9 +531,11 @@ def verificar_repositorio(p: Passo) -> None:
     quebrados = []
     for caminho, linha in re.findall(r"\]\(([^)#\s]+)#L(\d+)\)", readme):
         arquivo = RAIZ / caminho
-        if not arquivo.is_file() or int(linha) > len(arquivo.read_text(encoding="utf-8").splitlines()):
+        linhas = arquivo.read_text(encoding="utf-8").splitlines() if arquivo.is_file() else []
+        alvo = linhas[int(linha) - 1].strip() if 0 < int(linha) <= len(linhas) else ""
+        if not alvo or alvo.startswith(("#", '"""')):
             quebrados.append(f"{caminho}#L{linha}")
-    p.checar("links do README existem e a linha está no arquivo", not quebrados, quebrados)
+    p.checar("links do README existem e a linha aponta código (não vazia nem comentário)", not quebrados, quebrados)
     sem_trecho = []
     for n in range(1, 6):
         secao = re.search(rf"### {n}\. .*?(?=\n### |\n## |\Z)", readme, re.S)

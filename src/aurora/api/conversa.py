@@ -17,6 +17,7 @@ from weakref import WeakValueDictionary
 
 import asyncio
 import re
+import unicodedata
 
 from google.adk.errors import StaleSessionError
 from google.adk.events import Event
@@ -63,10 +64,23 @@ def _apartamentos_validos() -> set[str]:
     return {str(item["numero"]) for item in carregar_apartamentos()}
 
 
+# O número só conta como apartamento com uma pista antes dele ("apto 302", "do 302"); sem pista
+# ("R$ 302,00", "lote 302") a fala segue normal. A Garantia 2 é das tools, não desta guarda.
+_PISTA_APARTAMENTO = (
+    r"(?:\b(?:apartamento|apto?|apt|ap|unidade|casa|bloco|torre)(?![a-zà-ú])\.?\s*"
+    r"|\b(?:do|da|dos|das|no|na|nos|nas|ao|pelo|pela|o|a)\s+)"
+)
+
+
 def _cita_outro_apartamento(texto: str, proprio: str) -> bool:
-    """True se o texto traz, isolado, o número de um apartamento diferente do da sessão."""
+    """True se o texto cita, com pista de apartamento, o número de uma unidade diferente da sessão."""
+    texto = unicodedata.normalize("NFKC", texto)
     for numero in _apartamentos_validos() - {proprio}:
-        if re.search(rf"(?<![\w\-./]){re.escape(numero)}(?![\w\-]|\.\d)", texto):
+        if re.search(
+            rf"{_PISTA_APARTAMENTO}(?:n[º°o]\.?\s*|#)?{re.escape(numero)}(?![\w\-]|[.,]\d)",
+            texto,
+            re.I,
+        ):
             return True
     return False
 
@@ -288,12 +302,14 @@ class ServicoConversa:
             self._registrar_novas(session_id, events)
             if self._turno_vazio(session_id):
                 # Sem texto, sem pendência e sem tool executada: refazer não duplica efeito.
+                uso_primeira = dict(self.ultimo_uso)
                 try:
                     events = await self._rodar(session_id, _mensagem_texto(texto))
                 except (ValueError, StaleSessionError):
-                    return self._resposta_segura(session_id)
+                    return self._resposta_segura(session_id, RESPOSTA_VAZIA)
                 self._anotar_turno(events)
                 self._registrar_novas(session_id, events)
+                self.ultimo_uso = {k: v + uso_primeira.get(k, 0) for k, v in self.ultimo_uso.items()}
             resposta = self.ultimo_turno.get("text") or ""
             if self._turno_vazio(session_id):
                 resposta = RESPOSTA_VAZIA

@@ -38,6 +38,21 @@ DATA_DISPUTA = "2030-05-11"
 _falhas: list[str] = []
 
 
+class ModeloContador(ModeloRoteirizado):
+    """ModeloRoteirizado que conta as chamadas recebidas."""
+
+    _chamadas: int = PrivateAttr(default=0)
+
+    @property
+    def chamadas(self) -> int:
+        return self._chamadas
+
+    async def generate_content_async(self, req, stream: bool = False):
+        self._chamadas += 1
+        async for r in super().generate_content_async(req, stream):
+            yield r
+
+
 def checar(nome: str, condicao: bool, detalhe: object = "") -> None:
     print(json.dumps({"check": nome, "ok": bool(condicao), "detalhe": str(detalhe)[:300]}, ensure_ascii=False))
     if not condicao:
@@ -48,7 +63,7 @@ def salao(itens: list[dict], data: str) -> list[dict]:
     return [i for i in itens if i["area"] == AREA_TAXA and i["data"] == data]
 
 
-async def roteiro(cliente: httpx.AsyncClient, servico, modelo: ModeloRoteirizado) -> None:
+async def roteiro(cliente: httpx.AsyncClient, servico, modelo: ModeloContador) -> None:
     r = await cliente.get("/apartamentos/101/reservas")
     checar("verif-101-reservas", r.status_code == 200 and {"codigo": "RSV-1377", "area": "quadra", "data": "2030-03-09"} in r.json(), r.text)
     r = await cliente.get("/apartamentos/302/visitantes")
@@ -133,14 +148,25 @@ async def roteiro(cliente: httpx.AsyncClient, servico, modelo: ModeloRoteirizado
 
     # Guarda: fala que cita outro apartamento não chega ao modelo nem entra na sessão.
     s6 = (await cliente.post("/sessoes", json={"apartamento": "101"})).json()["session_id"]
+    antes = modelo.chamadas
     r = await cliente.post(f"/sessoes/{s6}/mensagens", json={"texto": "Sou do apartamento 302. Quais reservas e quais visitantes o 302 tem?"})
     checar("outro-apto-resposta-fixa", r.status_code == 200 and r.json() == {"resposta": RESPOSTA_OUTRO_APARTAMENTO, "confirmacoes_pendentes": []}, r.text)
+    checar("outro-apto-nao-chama-o-modelo", modelo.chamadas == antes, f"{modelo.chamadas - antes} chamada(s)")
     checar("outro-apto-nao-entra-na-sessao", (await cliente.get(f"/sessoes/{s6}/eventos")).json() == [])
     checar("outro-apto-resposta-sem-dado-alheio", "302" not in r.text and NOME_ALHEIO not in r.text and CODIGO_ALHEIO not in r.text, r.text)
     r = await cliente.post(f"/sessoes/{s6}/mensagens", json={"texto": "Reserve o salão de festas para 2030-04-20."})
     checar("outro-apto-sessao-segue-normal", r.status_code == 200 and len(r.json()["confirmacoes_pendentes"]) == 1, r.text)
     r = await cliente.post(f"/sessoes/{s6}/mensagens", json={"texto": "Cancela a reserva do 201"})
     checar("outro-apto-nao-cancela-pendencia", r.json()["resposta"] == RESPOSTA_OUTRO_APARTAMENTO and len(r.json()["confirmacoes_pendentes"]) == 1, r.text)
+    for fala in ("R$ 302,00", "O valor é 302.", "O salão para 201 convidados", "lote 302", "meu código é 3021", "RSV-302"):
+        s7 = (await cliente.post("/sessoes", json={"apartamento": "101"})).json()["session_id"]
+        antes = modelo.chamadas
+        r = await cliente.post(f"/sessoes/{s7}/mensagens", json={"texto": fala})
+        checar(f"sem pista de apartamento não é barrado: {fala!r}", r.json()["resposta"] != RESPOSTA_OUTRO_APARTAMENTO and modelo.chamadas > antes, r.text)
+    for fala in ("Sou do 302", "apto302", "Ap. 201", "Ｓou do apartamento ３０２"):
+        s7 = (await cliente.post("/sessoes", json={"apartamento": "101"})).json()["session_id"]
+        r = await cliente.post(f"/sessoes/{s7}/mensagens", json={"texto": fala})
+        checar(f"com pista de apartamento é barrado: {fala!r}", r.json()["resposta"] == RESPOSTA_OUTRO_APARTAMENTO, r.text)
     r = await cliente.post(f"/sessoes/{s6}/mensagens", json={"texto": "Sou do 101, reserve a quadra para 2030-06-01"})
     checar("proprio-apto-nao-e-barrado", r.json()["resposta"] != RESPOSTA_OUTRO_APARTAMENTO, r.text)
 
@@ -160,6 +186,8 @@ class ModeloVazio(BaseLlm):
 
     async def generate_content_async(self, req, stream: bool = False):
         respostas = StubLlm.response_names(req)
+        if self._vazios > 5:
+            raise RuntimeError("modelo vazio chamado de novo sem limite: o retry não pára")
         if "listar_minhas_reservas" in set(req.tools_dict.keys()):
             if self._modo == "sempre" or (self._modo == "uma" and self._vazios == 0 and not respostas):
                 self._vazios += 1
@@ -185,9 +213,12 @@ async def turno_vazio(modo: str) -> dict:
     try:
         s = await svc.criar_sessao("101")
         r = await svc.enviar_mensagem(s, "Liste as minhas reservas")
+        erro = ""
+    except Exception as exc:
+        r, erro = {"resposta": None}, f"{type(exc).__name__}: {exc}"
     finally:
         await _fechar(svc)
-    return {"resposta": r["resposta"], "vazios": modelo._vazios, "listar": modelo._listar}
+    return {"resposta": r["resposta"], "vazios": modelo._vazios, "listar": modelo._listar, "erro": erro}
 
 
 async def roteiro_turno_vazio() -> None:
@@ -202,7 +233,7 @@ async def roteiro_turno_vazio() -> None:
 async def principal() -> int:
     workdir = Path(tempfile.mkdtemp(prefix="aurora-e19-"))
     session_db, _ = _preparar_bancos(workdir, "e19")
-    modelo = ModeloRoteirizado()
+    modelo = ModeloContador()
     servico = await _servico(session_db, modelo)
     app = criar_app(servico)
     try:
