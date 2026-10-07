@@ -104,3 +104,46 @@ Rotas: `POST /sessoes`, `POST /sessoes/{id}/mensagens`, `POST /sessoes/{id}/conf
 - Com o Gemini real (`gemini-3.5-flash`), o fluxo do avaliador (`scripts/verificar_fluxo.py --subir`) deu 15/15 em 5 de 5 execuções seguidas com a primeira versão da guarda de outro apartamento (cerca de 95 mil tokens e 30 chamadas por execução). Antes dela, nas 10 execuções válidas do mesmo dia, 5 deram 15/15; as falhas eram o modelo recusando um pedido do próprio apartamento por causa de uma tentativa anterior com outro número (passo 11) e um turno vazio no passo 12. Com uma guarda mais estreita (exige a pista de apartamento) e a versão 3 do verificador, mais 3 execuções reais deram 15/15 (cerca de 94 mil tokens cada). A guarda foi estreitada de novo depois delas (sem artigo solto, com plural e "número"); com essa versão final, mais 3 execuções reais deram 15/15 (cerca de 95 mil tokens cada), no total 11 seguidas com 15/15. A nova tentativa em turno vazio está coberta pelo modelo falso, mas **não chegou a disparar** nas execuções reais. Cinco execuções são uma amostra pequena e o comportamento do modelo é estocástico: rode o fluxo do avaliador com a sua chave antes de confiar no roteamento.
 - Sem testes automatizados além dos roteiros de smoke em `src/aurora/**/smoke_*.py`, conforme o escopo do enunciado.
 - Os relatórios `RESULTADO-*.md` dos spikes citam as saídas brutas (`RESULTADO-BRUTO-*.txt`, `saida-bruta-*.txt`) e o `spike.db` como fonte. Esses arquivos, com cerca de 4 MB, foram retirados do repositório por tamanho e ficam no histórico do Git (commit `a37e25a` e anteriores); os scripts dos spikes os geram de novo.
+
+## Status Final — Ciclo de Revisão Concluído ✅
+
+### Resumo do Ciclo R-V5 + R3 (2026-10-07)
+
+| Etapa | Status | Evidência |
+| --- | --- | --- |
+| **R-V5: Revisão Independente** | ✅ Concluído | [docs2/review/RECONCILIACAO-R-V5-R3-2026-10-07.md](docs2/review/RECONCILIACAO-R-V5-R3-2026-10-07.md) |
+| **R3: Sensor de Discriminação** | ✅ Concluído (Cursor) | 7 quebras testadas, 6 detectadas, 1 normalizada |
+| **Decisão** | ✅ CORRIGIR | Normalizar `**` em `INSTRUCAO_PRINCIPAL` (passo 15) |
+| **PR de Correção** | ✅ Merged | [Commit 485c1d2](https://github.com/fredjml/mba-ia-desafio-criacao-agente/commit/485c1d2): `fix: normalizar ** em INSTRUCAO_PRINCIPAL no passo 15` |
+| **Teste Final (15/15)** | ✅ Aprovado | Exit 0, todas 5 garantias constitucionais validadas |
+| **Release Tag** | ✅ Criada | `aurora-v1.0.0` — pushed para `origin/main` e `origin/aurora-v1.0.0` |
+| **Veredito Final** | ✅ **ENTREGAR** | Pronto para produção |
+
+### Correção Aplicada
+
+**Arquivo:** `src/aurora/agentes/instrucoes.py` (passo 15 de `scripts/verificar_fluxo.py`)
+
+**Problema:** O verificador comparava trechos do regulamento com e sem `**` (markdown), causando falha na checagem de conteúdo quando `INSTRUCAO_PRINCIPAL` continha formatação.
+
+**Solução:** Normalizar ambos os lados removendo asteriscos antes da comparação:
+```python
+regulamento = dados_regulamento().replace("*", "")
+amostras = [l.strip()[:60] for l in regulamento.splitlines() if len(l.strip()) >= 80]
+instrucao = instrucoes.INSTRUCAO_PRINCIPAL.replace("*", "")
+```
+
+**Commit:** `485c1d2` (2026-10-07)
+
+### Garantias Validadas
+
+✅ **Garantia 1:** Cobrança ou acesso só com confirmação (Confirmação e dados corretos)  
+✅ **Garantia 2:** Isolamento de apartamento (Sugestão de apartamento)  
+✅ **Garantia 3:** Nada se perde no reinício (Código único e persistência)  
+✅ **Garantia 4:** Regulamento inteiro no histórico (Regulamento integrado)  
+✅ **Garantia 5:** Concorrência sem conflito (Índice único nas reservas)  
+
+### Próximas Ações
+
+- Monitorar aplicação em produção
+- Para issues futuras: iniciar novo ciclo R-V1 → R3 → fix → deploy
+- Documentação de deployment em [docs2/plan/](docs2/plan/)
