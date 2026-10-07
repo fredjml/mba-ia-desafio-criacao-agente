@@ -70,7 +70,7 @@ async def roteiro(cliente: httpx.AsyncClient, servico, modelo: ModeloContador) -
     checar("verif-302-visitantes", r.status_code == 200 and {"nome": NOME_ALHEIO, "data": "2030-03-16"} in r.json(), r.text)
 
     r = await cliente.post("/sessoes", json={"apartamento": "101"})
-    checar("sessao-201", r.status_code == 201 and "session_id" in r.json(), r.text)
+    checar("sessao-101", r.status_code == 201 and "session_id" in r.json(), r.text)
     s1 = r.json()["session_id"]
 
     for rota, corpo in (
