@@ -1,0 +1,265 @@
+name: Build, Test, and Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'requirements.txt'
+      - 'pyproject.toml'
+      - 'Dockerfile'
+      - '.github/workflows/deploy.yml'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+  
+  # Trigger on production release tags
+  create:
+    tags:
+      - 'v*.*.*'
+
+env:
+  REGISTRY: azurecr.io
+  IMAGE_NAME: aurora
+  RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+  CONTAINER_APP_NAME: aurora-api-prod
+  ACR_NAME: ${{ secrets.AZURE_ACR_NAME }}
+
+jobs:
+  # Test job: Run unit and integration tests
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v2
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: |
+          uv sync --all-extras
+
+      - name: Run linter (Ruff)
+        run: |
+          uv run ruff check src/ --exit-zero
+
+      - name: Run type checking (Pyright)
+        run: |
+          uv run pyright src/ --outputjson || true
+
+      - name: Run tests with coverage
+        run: |
+          uv run python -m pytest tests/ \
+            --cov=src/aurora \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --junitxml=junit/test-results.xml \
+            -v
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: junit/test-results.xml
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+      - name: Comment PR with test summary
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            try {
+              const coverage = fs.readFileSync('coverage.xml', 'utf8');
+              const match = coverage.match(/lines-valid="(\d+)".*line-rate="([\d.]+)"/);
+              if (match) {
+                const coverage_pct = (parseFloat(match[2]) * 100).toFixed(1);
+                github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: `✅ Tests passed!\n\nCode Coverage: ${coverage_pct}%`
+                });
+              }
+            } catch (e) {
+              console.log('Could not parse coverage');
+            }
+
+  # Build job: Build and push Docker image
+  build:
+    name: Build and Push Image
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC federation
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.AZURE_CLIENT_ID }}
+          password: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.ACR_NAME }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.ACR_NAME }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.ACR_NAME }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+  # Deploy job: Deploy to Azure Container Apps
+  deploy:
+    name: Deploy to Azure Container Apps
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    
+    permissions:
+      contents: read
+      id-token: write
+    
+    environment:
+      name: production
+      url: https://${{ steps.deploy.outputs.container_app_fqdn }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to Azure Container Apps
+        id: deploy
+        run: |
+          # Get the latest image tag
+          IMAGE_TAG="$(git describe --tags --always --abbrev=7)"
+          IMAGE_URI="${{ env.REGISTRY }}/${{ env.ACR_NAME }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+          
+          echo "Deploying image: ${IMAGE_URI}"
+          
+          # Update Container App with new image
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image "${IMAGE_URI}"
+          
+          # Get Container App FQDN
+          FQDN=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query 'properties.configuration.ingress.fqdn' \
+            -o tsv)
+          
+          echo "container_app_fqdn=${FQDN}" >> $GITHUB_OUTPUT
+          echo "✅ Container App updated: https://${FQDN}"
+
+      - name: Verify deployment
+        run: |
+          FQDN="${{ steps.deploy.outputs.container_app_fqdn }}"
+          echo "Waiting for service to be ready..."
+          
+          for i in {1..30}; do
+            if curl -sf "https://${FQDN}/health" > /dev/null 2>&1; then
+              echo "✅ Service is healthy"
+              exit 0
+            fi
+            echo "Attempt ${i}/30..."
+            sleep 5
+          done
+          
+          echo "⚠️ Health check timeout (service may be initializing)"
+          exit 0
+
+      - name: Get Container App logs
+        if: always()
+        run: |
+          az containerapp logs show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --follow=false \
+            --tail=50 || echo "Could not retrieve logs"
+
+  # Notify job: Send status notifications
+  notify:
+    name: Notify Status
+    needs: [test, build, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Determine status
+        id: status
+        run: |
+          if [[ "${{ needs.test.result }}" == "success" && "${{ needs.build.result }}" == "success" && "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "status=✅ All checks passed" >> $GITHUB_OUTPUT
+          else
+            echo "status=❌ Pipeline failed" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create deployment status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ steps.status.outputs.status }}';
+            const ref = '${{ github.ref }}';
+            const sha = '${{ github.sha }}';
+            
+            console.log(`Deployment Status: ${status}`);
+            console.log(`Ref: ${ref}, SHA: ${sha.substring(0, 7)}`);

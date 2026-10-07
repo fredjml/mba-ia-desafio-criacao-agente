@@ -1,0 +1,50 @@
+# Aurora Virtual Assistant - Terraform Configuration Example
+# Copy this file to terraform.tfvars and update values for your deployment
+# 
+# Usage:
+# 1. Copy: cp terraform.tfvars.example terraform.tfvars
+# 2. Edit: Update values below for your environment
+# 3. Plan: terraform plan
+# 4. Apply: terraform apply
+
+# Resource naming prefix (lowercase, max 20 chars)
+resource_prefix = "aurora"
+
+# Azure region for deployment
+# Valid: eastus, eastus2, westus, westus2, centralus, northeurope, westeurope, etc.
+location = "eastus"
+
+# Environment name
+# Valid: dev, staging, prod
+environment = "prod"
+
+# Container image URI (use your ACR image)
+# Format: <acr-name>.azurecr.io/aurora:<tag>
+# Example: aursoraacr.azurecr.io/aurora:latest
+container_image_uri = ""
+
+# Container CPU allocation
+# Valid: 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0
+container_cpu = "1.0"
+
+# Container memory allocation in GiB
+# Valid: 0.5 to 4.0
+container_memory = "2.0"
+
+# Container port number
+container_port = 8000
+
+# Minimum number of container replicas
+min_replicas = 1
+
+# Maximum number of container replicas (autoscaling)
+max_replicas = 3
+
+# Application log level
+# Valid: DEBUG, INFO, WARNING, ERROR
+log_level = "INFO"
+
+# LLM API Key (stored securely in Key Vault)
+# IMPORTANT: Update this with your actual API key
+# This will be stored in Azure Key Vault and injected at runtime
+llm_api_key = "PLACEHOLDER_LLM_API_KEY"

@@ -9,3 +9,9 @@ spike_confirmacao/adk_antigo/
 spike_*/RESULTADO-BRUTO-*.txt
 spike_*/saida-bruta-*.txt
 spike_*/*.db
+# Terraform
+terraform/terraform.tfvars
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate
+terraform/*.tfstate.*
