@@ -6,3 +6,6 @@ var/
 *.sqlite3-wal
 *.sqlite3-shm
 spike_confirmacao/adk_antigo/
+spike_*/RESULTADO-BRUTO-*.txt
+spike_*/saida-bruta-*.txt
+spike_*/*.db
