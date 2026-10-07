@@ -158,17 +158,24 @@ async def roteiro(cliente: httpx.AsyncClient, servico, modelo: ModeloContador) -
     checar("outro-apto-sessao-segue-normal", r.status_code == 200 and len(r.json()["confirmacoes_pendentes"]) == 1, r.text)
     r = await cliente.post(f"/sessoes/{s6}/mensagens", json={"texto": "Cancela a reserva do 201"})
     checar("outro-apto-nao-cancela-pendencia", r.json()["resposta"] == RESPOSTA_OUTRO_APARTAMENTO and len(r.json()["confirmacoes_pendentes"]) == 1, r.text)
-    for fala in ("R$ 302,00", "O valor é 302.", "O salão para 201 convidados", "lote 302", "meu código é 3021", "RSV-302"):
+    for fala in ("R$ 302,00", "O valor é 302.", "O salão para 201 convidados", "lote 302", "meu código é 3021", "RSV-302",
+                 "festa de 50 a 201 convidados", "o total chega a 302 reais", "festa em casa 201 pessoas"):
         s7 = (await cliente.post("/sessoes", json={"apartamento": "101"})).json()["session_id"]
         antes = modelo.chamadas
         r = await cliente.post(f"/sessoes/{s7}/mensagens", json={"texto": fala})
         checar(f"sem pista de apartamento não é barrado: {fala!r}", r.json()["resposta"] != RESPOSTA_OUTRO_APARTAMENTO and modelo.chamadas > antes, r.text)
-    for fala in ("Sou do 302", "apto302", "Ap. 201", "Ｓou do apartamento ３０２"):
+    for fala in ("Sou do 302", "apto302", "Ap. 201", "Ｓou do apartamento ３０２",
+                 "apartamentos 302", "unidades 201", "apartamento número 302"):
         s7 = (await cliente.post("/sessoes", json={"apartamento": "101"})).json()["session_id"]
         r = await cliente.post(f"/sessoes/{s7}/mensagens", json={"texto": fala})
         checar(f"com pista de apartamento é barrado: {fala!r}", r.json()["resposta"] == RESPOSTA_OUTRO_APARTAMENTO, r.text)
     r = await cliente.post(f"/sessoes/{s6}/mensagens", json={"texto": "Sou do 101, reserve a quadra para 2030-06-01"})
     checar("proprio-apto-nao-e-barrado", r.json()["resposta"] != RESPOSTA_OUTRO_APARTAMENTO, r.text)
+
+
+def _vazio() -> LlmResponse:
+    uso = types.GenerateContentResponseUsageMetadata(prompt_token_count=10, candidates_token_count=1, total_token_count=11)
+    return LlmResponse(content=types.Content(role="model", parts=[types.Part(text="")]), usage_metadata=uso)
 
 
 class ModeloVazio(BaseLlm):
@@ -189,14 +196,16 @@ class ModeloVazio(BaseLlm):
         if self._vazios > 5:
             raise RuntimeError("modelo vazio chamado de novo sem limite: o retry não pára")
         if "listar_minhas_reservas" in set(req.tools_dict.keys()):
-            if self._modo == "sempre" or (self._modo == "uma" and self._vazios == 0 and not respostas):
+            if self._modo == "erro_retry" and self._vazios >= 1:
+                raise ValueError("falha na nova tentativa")
+            if self._modo in ("sempre", "erro_retry") or (self._modo == "uma" and self._vazios == 0 and not respostas):
                 self._vazios += 1
-                yield LlmResponse(content=types.Content(role="model", parts=[types.Part(text="")]))
+                yield _vazio()
                 return
             if self._modo == "tool_vazio":
                 if "listar_minhas_reservas" in respostas:
                     self._vazios += 1
-                    yield LlmResponse(content=types.Content(role="model", parts=[types.Part(text="")]))
+                    yield _vazio()
                 else:
                     self._listar += 1
                     yield StubLlm.call("listar_minhas_reservas", "fc-lista-1", {})
@@ -218,7 +227,7 @@ async def turno_vazio(modo: str) -> dict:
         r, erro = {"resposta": None}, f"{type(exc).__name__}: {exc}"
     finally:
         await _fechar(svc)
-    return {"resposta": r["resposta"], "vazios": modelo._vazios, "listar": modelo._listar, "erro": erro}
+    return {"resposta": r["resposta"], "vazios": modelo._vazios, "listar": modelo._listar, "erro": erro, "uso": dict(svc.ultimo_uso)}
 
 
 async def roteiro_turno_vazio() -> None:
@@ -226,11 +235,15 @@ async def roteiro_turno_vazio() -> None:
     checar("vazio-uma-vez: refaz o turno e recupera a resposta", r["resposta"] not in ("", RESPOSTA_VAZIA) and r["vazios"] == 1, r)
     r = await turno_vazio("sempre")
     checar("vazio-sempre: uma nova tentativa e depois a frase fixa", r["resposta"] == RESPOSTA_VAZIA and r["vazios"] == 2, r)
+    checar("vazio-sempre: o uso soma as duas tentativas", r["uso"]["total"] == 22 and r["uso"]["chamadas"] == 2, r["uso"])
+    r = await turno_vazio("erro_retry")
+    checar("erro na nova tentativa: frase fixa e uso da primeira conservado", r["resposta"] == RESPOSTA_VAZIA and r["uso"]["total"] == 11 and r["uso"]["chamadas"] == 1, r)
     r = await turno_vazio("tool_vazio")
     checar("tool executada e modelo vazio: não refaz (sem efeito duplicado)", r["listar"] == 1 and r["vazios"] == 1 and r["resposta"] != RESPOSTA_VAZIA, r)
 
 
 async def principal() -> int:
+    sys.stdout.reconfigure(encoding="utf-8")  # nomes de check com largura total quebram o console cp1252
     workdir = Path(tempfile.mkdtemp(prefix="aurora-e19-"))
     session_db, _ = _preparar_bancos(workdir, "e19")
     modelo = ModeloContador()
