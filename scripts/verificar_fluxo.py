@@ -399,6 +399,16 @@ def executar(api: Api, servidor: Servidor | None, relatorio: list[Passo]) -> Non
         codigos = [r["codigo"] for r in r101]
         p.checar("há ao menos 2 reservas ativas, de códigos distintos e fora da semente", len(codigos) >= 2 and len(codigos) == len(set(codigos)) and not (set(codigos) & CODIGOS_SEMENTE), codigos)
         p.checar("302 mantém RSV-4821", any(r["codigo"] == "RSV-4821" for r in api.reservas("302")))
+        # Os códigos acima nasceram antes do reinício: só uma reserva nova depois dele prova que a sequência persistiu.
+        vistos = {r["codigo"] for r in r101} | CODIGOS_SEMENTE
+        enviar(p, s1, "Reserve a quadra para 2030-06-02.")
+        novos = [r for r in api.reservas("101") if r["area"] == "quadra" and r["data"] == "2030-06-02" and r["codigo"] not in vistos]
+        maior = max(int(c.rsplit("-", 1)[-1]) for c in vistos)
+        p.checar(
+            "código emitido depois do reinício é novo e maior que os anteriores",
+            len(novos) == 1 and int(novos[0]["codigo"].rsplit("-", 1)[-1]) > maior,
+            [r["codigo"] for r in novos],
+        )
 
     def p14(p: Passo) -> None:
         s3, s4 = api.sessao("101"), api.sessao("201")
