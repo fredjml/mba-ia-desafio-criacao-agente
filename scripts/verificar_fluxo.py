@@ -525,7 +525,8 @@ def verificar_repositorio(p: Passo) -> None:
 
     regulamento = dados_regulamento().replace("*", "")
     amostras = [l.strip()[:60] for l in regulamento.splitlines() if len(l.strip()) >= 80]
-    p.checar("INSTRUCAO_PRINCIPAL sem trecho do regulamento", bool(amostras) and not any(a in instrucoes.INSTRUCAO_PRINCIPAL for a in amostras))
+    instrucao = instrucoes.INSTRUCAO_PRINCIPAL.replace("*", "")
+    p.checar("INSTRUCAO_PRINCIPAL sem trecho do regulamento", bool(amostras) and not any(a in instrucao for a in amostras))
 
     dominio = (RAIZ / "src" / "aurora" / "dados" / "dominio.py").read_text(encoding="utf-8")
     p.checar("fonte: índice único e IntegrityError na gravação", "ux_reservas_ativa" in dominio and "IntegrityError" in dominio)
